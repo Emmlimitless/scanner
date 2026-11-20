@@ -1,0 +1,49 @@
+name: Inside candle scan
+
+on:
+  # Triggered every 5 minutes by cron-job.org (see setup guide)
+  workflow_dispatch:
+  # Backup schedule in case the external trigger ever fails
+  schedule:
+    - cron: "3,18,33,48 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: inside-candle-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Scan for inside candles
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TV_USERNAME: ${{ secrets.TV_USERNAME }}
+          TV_PASSWORD: ${{ secrets.TV_PASSWORD }}
+        run: python scan.py
+
+      - name: Save alert state
+        run: |
+          if [ -n "$(git status --porcelain state.json 2>/dev/null)" ]; then
+            git config user.name "scanner-bot"
+            git config user.email "scanner-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update alert state"
+            git pull --rebase
+            git push
+          fi
