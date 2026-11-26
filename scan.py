@@ -1,11 +1,16 @@
 """
-Run-once inside-candle scanner for GitHub Actions (5-minute timeframe, 28 pairs).
+Run-once 3-candle breakout scanner for GitHub Actions (5-minute timeframe, 28 pairs).
+Data: FOREXCOM feed via TradingView only (no fallback).
 
-Each run:
-  1. Fetches recent 5m candles (TradingView FOREXCOM feed first, Yahoo Finance as fallback).
-  2. Looks at the last few CLOSED candles, so a delayed run still catches signals.
-  3. Sends one Telegram message for any inside candle not alerted before.
-  4. Remembers what it alerted in state.json (the workflow commits this file).
+Pattern (all three candles consecutive):
+  Candle 1: any candle (the "mother" candle)
+  Candle 2: inside candle of candle 1 (lower high AND higher low)
+  Candle 3: CLOSES above the highest wick of candles 1 and 2 (bullish breakout),
+            or CLOSES below the lowest wick of candles 1 and 2 (bearish breakout)
+An alert is sent only after candle 3 has fully closed.
+
+Each run checks the last few closed candles, so a delayed run still catches signals.
+Alerted candles are remembered in state.json (the workflow commits this file).
 """
 
 import json
@@ -23,8 +28,9 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TV_USER = os.environ.get("TV_USERNAME", "").strip()
 TV_PASS = os.environ.get("TV_PASSWORD", "").strip()
 
+EXCHANGE = "FOREXCOM"
 TF = 300                 # 5-minute candles, in seconds
-LOOKBACK_CANDLES = 3     # how many recent closed candles a run may alert on
+LOOKBACK_CANDLES = 3     # how many recent closed candles a run may alert on (as candle 3)
 MAX_RETRIES = 3          # re-fetch if the newest candle hasn't appeared yet
 RETRY_WAIT = 12          # seconds between retries
 RETRY_WINDOW = 100       # only retry within this many seconds of the candle close
@@ -57,8 +63,8 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
 
-# ---------- Data sources ----------
-# Every source returns rows of (candle_open_epoch, high, low), oldest first,
+# ---------- Data (FOREXCOM via TradingView) ----------
+# Rows are (candle_open_epoch, open, high, low, close), oldest first,
 # and may include the still-forming candle.
 _tv = None
 
@@ -71,7 +77,7 @@ def connect_tv():
         log("TradingView connected" + (" (logged in)" if TV_USER and TV_PASS else " (no login)"))
     except Exception as e:
         _tv = None
-        log(f"TradingView unavailable, will use Yahoo: {e}")
+        log(f"TradingView connection failed: {e}")
 
 
 def fetch_tv(pair):
@@ -79,40 +85,17 @@ def fetch_tv(pair):
         return None
     try:
         from tvDatafeed import Interval
-        df = _tv.get_hist(symbol=pair, exchange="FOREXCOM", interval=Interval.in_5_minute, n_bars=8)
-        if df is None or len(df) < 3:
+        df = _tv.get_hist(symbol=pair, exchange=EXCHANGE, interval=Interval.in_5_minute, n_bars=10)
+        if df is None or len(df) < 4:
             return None
         return [
-            (int(idx.to_pydatetime().timestamp()), float(r["high"]), float(r["low"]))
+            (int(idx.to_pydatetime().timestamp()),
+             float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]))
             for idx, r in df.iterrows()
         ]
     except Exception as e:
         log(f"{pair}: TradingView error: {e}")
         return None
-
-
-def fetch_yahoo(pairs):
-    out = {}
-    if not pairs:
-        return out
-    try:
-        import yfinance as yf
-        tickers = {p: f"{p}=X" for p in pairs}
-        df = yf.download(
-            tickers=list(tickers.values()), interval="5m", period="2d",
-            group_by="ticker", progress=False, threads=True, auto_adjust=False,
-        )
-        for pair, t in tickers.items():
-            try:
-                bars = df[t].dropna(subset=["High", "Low"])
-                rows = [(int(idx.value // 10**9), float(r["High"]), float(r["Low"])) for idx, r in bars.iterrows()]
-                if len(rows) >= 3:
-                    out[pair] = rows
-            except KeyError:
-                continue
-    except Exception as e:
-        log(f"Yahoo error: {e}")
-    return out
 
 
 # ---------- Pattern logic ----------
@@ -125,20 +108,30 @@ def newest_closed_ts(rows, boundary):
     return c[-1][0] if c else 0
 
 
-def find_inside(rows, boundary, last_alerted_ts):
-    """Return open-timestamps of recent closed candles that are inside candles."""
+def find_signals(rows, boundary, last_alerted_ts):
+    """Return a list of (candle3_open_ts, direction, close, c1_high, c1_low)."""
     closed = closed_rows(rows, boundary)
-    hits = []
-    for i in range(1, len(closed)):
-        ts, high, low = closed[i]
-        _, prev_high, prev_low = closed[i - 1]
-        if ts < boundary - LOOKBACK_CANDLES * TF:   # too old to alert on
+    out = []
+    for i in range(2, len(closed)):
+        c1, c2, c3 = closed[i - 2], closed[i - 1], closed[i]
+        ts3 = c3[0]
+        if ts3 < boundary - LOOKBACK_CANDLES * TF:      # too old to alert on
             continue
-        if ts <= last_alerted_ts:                    # already alerted
+        if ts3 <= last_alerted_ts:                       # already alerted
             continue
-        if high < prev_high and low > prev_low:
-            hits.append(ts)
-    return hits
+        if c2[0] != c1[0] + TF or c3[0] != c2[0] + TF:   # must be three consecutive candles
+            continue
+        _, _, h1, l1, _ = c1
+        _, _, h2, l2, _ = c2
+        close3 = c3[4]
+        if not (h2 < h1 and l2 > l1):                    # candle 2 must be inside candle 1
+            continue
+        top, bottom = max(h1, h2), min(l1, l2)           # highest wick / lowest wick of both candles
+        if close3 > top:                                 # closes above both candles (wicks included)
+            out.append((ts3, "Bullish", close3, h1, l1))
+        elif close3 < bottom:                            # closes below both candles (wicks included)
+            out.append((ts3, "Bearish", close3, h1, l1))
+    return out
 
 
 # ---------- Telegram ----------
@@ -162,29 +155,22 @@ def send_telegram(text):
 
 # ---------- Main ----------
 def main():
-    now = time.time()
-    boundary = int(now) // TF * TF
+    boundary = int(time.time()) // TF * TF
     log(f"Scan started; latest closed candle ends {datetime.fromtimestamp(boundary, timezone.utc):%H:%M} UTC")
 
     state = load_state()
     connect_tv()
+    if _tv is None:
+        log("No data source available; exiting")
+        return
 
-    data, source = {}, {}
+    data = {}
     pending = list(PAIRS)
-
     for attempt in range(MAX_RETRIES + 1):
-        # TradingView first
-        if _tv is not None and pending:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                for pair, rows in zip(pending, pool.map(fetch_tv, pending)):
-                    if rows:
-                        data[pair], source[pair] = rows, "FOREXCOM"
-        # Yahoo fallback for anything TradingView didn't give us
-        missing = [p for p in pending if p not in data or not data[p]]
-        if missing:
-            for pair, rows in fetch_yahoo(missing).items():
-                data[pair], source[pair] = rows, "Yahoo"
-
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for pair, rows in zip(pending, pool.map(fetch_tv, pending)):
+                if rows:
+                    data[pair] = rows
         pending = [p for p in PAIRS if newest_closed_ts(data.get(p), boundary) < boundary - TF]
         if not pending:
             break
@@ -194,36 +180,33 @@ def main():
         else:
             break
 
-    n_tv = sum(1 for s in source.values() if s == "FOREXCOM")
-    n_yh = sum(1 for s in source.values() if s == "Yahoo")
-    log(f"Data: {n_tv} pairs from FOREXCOM/TradingView, {n_yh} from Yahoo, "
-        f"{len(PAIRS) - len(data)} with no data")
+    log(f"Data from FOREXCOM/TradingView for {len(data)} of {len(PAIRS)} pairs")
 
-    new_state, lines, used_yahoo = dict(state), [], False
+    new_state, lines = dict(state), []
     for pair in PAIRS:
         rows = data.get(pair)
         if not rows:
             continue
-        hits = find_inside(rows, boundary, state.get(pair, 0))
-        if hits:
-            latest = max(hits)
-            closed_at = datetime.fromtimestamp(latest + TF, timezone.utc).strftime("%H:%M")
-            tag = "" if source[pair] == "FOREXCOM" else " *"
-            used_yahoo = used_yahoo or bool(tag)
-            lines.append(f"{pair} (closed {closed_at} UTC){tag}")
-            new_state[pair] = latest
+        signals = find_signals(rows, boundary, state.get(pair, 0))
+        if signals:
+            ts3, direction, close3, h1, l1 = signals[-1]
+            d = 3 if "JPY" in pair else 5
+            closed_at = datetime.fromtimestamp(ts3 + TF, timezone.utc).strftime("%H:%M")
+            lines.append(
+                f"{pair}: {direction} breakout, closed {close3:.{d}f} "
+                f"(range {l1:.{d}f}-{h1:.{d}f}) at {closed_at} UTC"
+            )
+            new_state[pair] = ts3
 
     if lines:
-        text = "Inside candle (5m):\n" + "\n".join(lines)
-        if used_yahoo:
-            text += "\n* Yahoo data (FOREXCOM feed unavailable for this pair)"
+        text = "5m inside-candle breakout:\n" + "\n".join(lines)
         log(text.replace("\n", " | "))
         if send_telegram(text):
             save_state(new_state)
         else:
             log("Alert not delivered; state not updated so the next run retries")
     else:
-        log("No new inside candles")
+        log("No new breakout signals")
 
 
 if __name__ == "__main__":
